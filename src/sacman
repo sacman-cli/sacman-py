@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+import sys
+import subprocess
+
+def parse_args(args):
+    if not args:
+        return {
+            "error": "No arguments provided. Use -h for help.",
+            "command": [],
+            "dry_run": False
+        }
+
+    options_arg = None
+    for arg in args:
+        if arg.startswith('-') and not arg.startswith('--'):
+            options_arg = arg
+            break
+    
+    if not options_arg:
+        return {
+            "error": None,
+            "explanation": "No sacman options detected. Passing arguments directly to systemctl.",
+            "command": ["systemctl"] + args,
+            "dry_run": False
+        }
+
+    flags = options_arg[1:]
+    main_op = flags[0]
+    modifiers = set(flags[1:])
+    
+    passthrough_opts = [arg for arg in args if arg.startswith('--')]
+    non_flag_args = [arg for arg in args if arg != options_arg and not arg.startswith('--')]
+
+    systemctl_options = []
+    if 'u' in modifiers: systemctl_options.append('--user')
+    if 'n' in modifiers: systemctl_options.append('--now')
+    if 'a' in modifiers: systemctl_options.append('--all')
+    if 'r' in modifiers: systemctl_options.append('--recursive')
+    if 'f' in modifiers: systemctl_options.append('--force')
+
+    is_sacman_dry_run = 'z' in modifiers
+    
+    command = ""
+    error = None
+
+    if main_op == 'D':
+        systemctl_options.append('--dry-run')
+        # Here we should find the *next* main op
+        # This is a simplification; a real implementation would need more robust parsing.
+        error = "-D must be combined with another operation, which is not supported in this simple parser."
+
+    elif main_op == 'S':
+        if 't' in modifiers:
+            if 'y' in modifiers:
+                if 'd' in modifiers:
+                    command = 'try-reload-or-restart' if 'q' in modifiers else 'reload-or-restart'
+                elif 'c' in modifiers:
+                    command = 'condrestart'
+                elif 'q' in modifiers:
+                    command = 'try-restart'
+                else:
+                    command = 'restart'
+            else:
+                command = 'start'
+        elif 'y' in modifiers:
+            command = 'reenable'
+        elif 'd' in modifiers:
+            command = 'reload'
+        elif 'm' in modifiers:
+            command = 'unmask'
+        else:
+            command = 'enable'
+
+    elif main_op == 'R':
+        if 'c' in modifiers: command = 'clean'
+        elif 't' in modifiers: command = 'stop'
+        elif 'm' in modifiers: command = 'mask'
+        elif 'k' in modifiers: command = 'kill'
+        elif 'v' in modifiers: command = 'revert'
+        else: command = 'disable'
+
+    elif main_op == 'Q':
+        mappings = {
+            'l': 'list-unit-files', 'd': 'list-dependencies', 'o': 'list-automounts',
+            'm': 'list-machines', 't': 'list-timers', 'p': 'list-paths',
+            'k': 'list-sockets', 'y': 'list-units', 'j': 'list-jobs', 'i': 'status'
+        }
+        cmd_mods = [m for m in modifiers if m in mappings]
+        if len(cmd_mods) > 1:
+            error = f"Operation -Q accepts only one command modifier (found: {', '.join(cmd_mods)})."
+        elif len(cmd_mods) == 0:
+            error = "Operation -Q requires a command modifier (e.g., -Ql, -Qi, -Qy)."
+        else:
+            command = mappings[cmd_mods[0]]
+
+    elif main_op == 'F':
+        if 'e' in modifiers: command = 'edit'
+        else: error = "Operation -F requires a modifier (e.g., -Fe)."
+
+    elif main_op == 'T':
+        mappings = {'s': 'is-enabled', 'c': 'is-system-running', 'e': 'is-failed'}
+        cmd_mods = [m for m in modifiers if m in mappings]
+        if len(cmd_mods) > 1:
+            error = f"Operation -T accepts only one command modifier (found: {', '.join(cmd_mods)})."
+        elif len(cmd_mods) == 0:
+            error = "Operation -T requires a command modifier (e.g., -Ts, -Tc)."
+        else:
+            command = mappings[cmd_mods[0]]
+
+    elif main_op == 'J':
+        command = 'cancel' if 'c' in modifiers else 'list-jobs'
+
+    elif main_op == 'N':
+        if 's' in modifiers: command = 'set-environment'
+        elif 'n' in modifiers: command = 'unset-environment'
+        elif 'i' in modifiers: command = 'import-environment'
+        else: command = 'show-environment'
+        
+    else:
+        error = f"Unknown main operation: -{main_op}"
+
+    if error:
+        return {"error": error, "command": [], "dry_run": is_sacman_dry_run}
+
+    final_command = ["systemctl"] + systemctl_options + passthrough_opts + [command] + non_flag_args
+    final_command = [item for item in final_command if item]
+
+    return {"error": None, "command": final_command, "dry_run": is_sacman_dry_run}
+
+
+def main():
+    if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
+        print("Usage: sacman SACMAN_OPTIONS [SYSTEMD_OPTIONS...] [NAME...]")
+        print("A pacman-like wrapper for systemctl.")
+        # A real help message would be generated from the spec.
+        sys.exit(0)
+
+    result = parse_args(sys.argv[1:])
+
+    if result["error"]:
+        print(f"Error: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+
+    if result["dry_run"]:
+        print(" ".join(result['command']))
+    else:
+        try:
+            subprocess.run(result["command"], check=True)
+        except FileNotFoundError:
+            print("Error: 'systemctl' command not found. Is systemd installed and in your PATH?", file=sys.stderr)
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            # systemctl often returns non-zero exit codes for statuses, so we exit with its code
+            sys.exit(e.returncode)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user.", file=sys.stderr)
+            sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
+
